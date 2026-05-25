@@ -2,6 +2,7 @@
 Australian Employment Data Dashboard
 Visualizes employment data by industry and state using ABS Labour Force Table 10
 Supports both CSV and XLSX formats with multiple sheets
+Handles ABS files with metadata headers
 """
 
 import streamlit as st
@@ -78,7 +79,7 @@ def load_employment_data():
     """
     Load ABS Labour Force Table 10 data
     Supports both CSV and XLSX formats
-    Handles multiple sheets in XLSX files
+    Handles multiple sheets and metadata headers in XLSX files
     """
     try:
         # Try loading XLSX first (supports multiple sheets)
@@ -104,16 +105,42 @@ def load_employment_data():
                     sheet_name = excel_file.sheet_names[0]
                 
                 st.info(f"📊 Loading data from sheet: **{sheet_name}**")
-                df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
-                logger.info(f"Loaded XLSX data from sheet: {sheet_name}")
+                
+                # Read with header=None first to inspect the structure
+                df_raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None)
+                
+                # Find the actual header row by looking for common ABS column patterns
+                header_row = 0
+                for i, row in df_raw.iterrows():
+                    row_str = ' '.join(row.astype(str).str.lower())
+                    if any(keyword in row_str for keyword in ['date', 'period', 'state', 'territory', 'employed', 'value', 'obs']):
+                        header_row = i
+                        break
+                
+                # Now read with the correct header row
+                df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=header_row)
+                logger.info(f"Loaded XLSX data from sheet: {sheet_name}, header row: {header_row}")
             except Exception as e:
                 logger.warning(f"Could not load XLSX: {str(e)}")
+                st.warning(f"⚠️ Could not load XLSX file: {str(e)}")
         
         # Fall back to CSV if XLSX not found or failed
         if df is None and os.path.exists(csv_path):
             try:
-                df = pd.read_csv(csv_path)
-                logger.info(f"Loaded data from CSV")
+                # Try reading with header=None first to find the actual header row
+                df_raw = pd.read_csv(csv_path, header=None)
+                
+                # Find the actual header row
+                header_row = 0
+                for i, row in df_raw.iterrows():
+                    row_str = ' '.join(row.astype(str).str.lower())
+                    if any(keyword in row_str for keyword in ['date', 'period', 'state', 'territory', 'employed', 'value', 'obs']):
+                        header_row = i
+                        break
+                
+                # Read with correct header
+                df = pd.read_csv(csv_path, header=header_row)
+                logger.info(f"Loaded CSV data, header row: {header_row}")
             except Exception as e:
                 logger.warning(f"Could not load CSV: {str(e)}")
         
@@ -145,44 +172,93 @@ def preprocess_employment_data(df):
     """
     Preprocess ABS Labour Force data
     Handles various ABS data formats and cleans the data
+    More robust column name matching
     """
     df = df.copy()
     
-    # Common column name variations from ABS
-    date_cols = ['DATE', 'Date', 'date', 'TIME_PERIOD', 'Month', 'month', 'Period']
-    state_cols = ['STATE', 'State', 'state', 'STATE_ABBREV', 'ST', 'Territory']
-    value_cols = ['VALUE', 'Value', 'value', 'OBS_VALUE', 'Obs_Value', 'Data', 'Employed']
-    series_cols = ['SERIES_ID', 'Series_ID', 'SERIES', 'Series', 'Series Title']
+    # Remove completely empty rows and columns
+    df = df.dropna(how='all')
+    df = df.loc[:, (df != '').all() | df.notna().any()]
     
-    # Find actual column names (case-insensitive)
+    # Common column name variations from ABS
+    date_cols = ['DATE', 'Date', 'date', 'TIME_PERIOD', 'Month', 'month', 'Period', 'period']
+    state_cols = ['STATE', 'State', 'state', 'STATE_ABBREV', 'ST', 'Territory', 'territory', 'A_TER', 'a_ter']
+    value_cols = ['VALUE', 'Value', 'value', 'OBS_VALUE', 'Obs_Value', 'Data', 'Employed', 'employed', 'OBS']
+    series_cols = ['SERIES_ID', 'Series_ID', 'SERIES', 'Series', 'Series Title', 'series_title']
+    
+    # Find actual column names (case-insensitive, handles slight variations)
     df_cols_lower = {col.lower(): col for col in df.columns}
     
-    date_col = next((col for col in date_cols if col.lower() in df_cols_lower), None)
-    if date_col:
-        date_col = df_cols_lower[date_col.lower()]
+    date_col = None
+    for col_variant in date_cols:
+        if col_variant.lower() in df_cols_lower:
+            date_col = df_cols_lower[col_variant.lower()]
+            break
     
-    state_col = next((col for col in state_cols if col.lower() in df_cols_lower), None)
-    if state_col:
-        state_col = df_cols_lower[state_col.lower()]
+    state_col = None
+    for col_variant in state_cols:
+        if col_variant.lower() in df_cols_lower:
+            state_col = df_cols_lower[col_variant.lower()]
+            break
     
-    value_col = next((col for col in value_cols if col.lower() in df_cols_lower), None)
-    if value_col:
-        value_col = df_cols_lower[value_col.lower()]
+    value_col = None
+    for col_variant in value_cols:
+        if col_variant.lower() in df_cols_lower:
+            value_col = df_cols_lower[col_variant.lower()]
+            break
     
-    series_col = next((col for col in series_cols if col.lower() in df_cols_lower), None)
-    if series_col:
-        series_col = df_cols_lower[series_col.lower()]
+    series_col = None
+    for col_variant in series_cols:
+        if col_variant.lower() in df_cols_lower:
+            series_col = df_cols_lower[col_variant.lower()]
+            break
     
+    # If still no match, try to infer from data patterns
+    if date_col is None:
+        for col in df.columns:
+            try:
+                pd.to_datetime(df[col].iloc[:10], errors='coerce')
+                if pd.to_datetime(df[col].iloc[:10], errors='coerce').notna().sum() > 0:
+                    date_col = col
+                    break
+            except:
+                pass
+    
+    if state_col is None:
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                unique_vals = df[col].unique()[:10]
+                if any(state in ' '.join(map(str, unique_vals)) for state in ['NSW', 'VIC', 'QLD', 'WA', 'SA', 'TAS', 'ACT', 'NT']):
+                    state_col = col
+                    break
+    
+    if value_col is None:
+        for col in df.columns:
+            try:
+                numeric_count = pd.to_numeric(df[col], errors='coerce').notna().sum()
+                if numeric_count > len(df) * 0.5:  # More than 50% numeric
+                    value_col = col
+                    break
+            except:
+                pass
+    
+    # Check if we found the required columns
     if not all([date_col, state_col, value_col]):
         st.error(f"""
         ⚠️ Data format not recognized. 
         
         Expected columns:
-        - Date/TIME_PERIOD (found: {date_col})
+        - Date/TIME_PERIOD/Period (found: {date_col})
         - State/Territory (found: {state_col})
-        - Value/OBS_VALUE (found: {value_col})
+        - Value/OBS_VALUE/Data (found: {value_col})
         
         Available columns in your file: {list(df.columns)}
+        
+        **Troubleshooting:**
+        1. Make sure you downloaded Table 10 from ABS
+        2. If using XLSX, ensure it's the correct sheet with data
+        3. Try saving as CSV and uploading again
+        4. Check that the file hasn't been modified
         """)
         return None
     
@@ -195,7 +271,9 @@ def preprocess_employment_data(df):
     if series_col:
         rename_dict[series_col] = 'Series'
     
-    df = df.rename(columns=rename_dict).dropna(subset=['Date', 'State', 'Value'])
+    df = df.rename(columns=rename_dict)
+    df = df[['Date', 'State', 'Value'] + ([col for col in df.columns if col not in ['Date', 'State', 'Value']])]
+    df = df.dropna(subset=['Date', 'State', 'Value'])
     
     # Convert date to datetime
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
@@ -212,9 +290,10 @@ def preprocess_employment_data(df):
     else:
         df['Industry'] = 'Employed'
     
-    # Remove rows with no state
-    df['State'] = df['State'].str.strip()
+    # Clean state column
+    df['State'] = df['State'].astype(str).str.strip()
     df = df[df['State'].str.len() > 0]
+    df = df[df['State'] != 'nan']
     
     # Sort by date
     df = df.sort_values('Date')
