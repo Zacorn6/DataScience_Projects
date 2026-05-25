@@ -1,6 +1,7 @@
 """
 Australian Employment Data Dashboard
 Visualizes employment data by industry and state using ABS Labour Force Table 10
+Supports both CSV and XLSX formats with multiple sheets
 """
 
 import streamlit as st
@@ -11,6 +12,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -75,23 +77,58 @@ st.markdown("""
 def load_employment_data():
     """
     Load ABS Labour Force Table 10 data
-    This function caches the data to improve performance
+    Supports both CSV and XLSX formats
+    Handles multiple sheets in XLSX files
     """
     try:
-        data_path = "au-employment-dashboard/data/table10.csv"
+        # Try loading XLSX first (supports multiple sheets)
+        xlsx_path = "au-employment-dashboard/data/table10.xlsx"
+        csv_path = "au-employment-dashboard/data/table10.csv"
         
-        # Try loading from local file
-        try:
-            df = pd.read_csv(data_path)
-            logger.info(f"Loaded data from {data_path}")
-        except FileNotFoundError:
+        df = None
+        
+        # Check XLSX first
+        if os.path.exists(xlsx_path):
+            try:
+                # Load all sheets from XLSX
+                excel_file = pd.ExcelFile(xlsx_path)
+                
+                # Try to find the main data sheet (usually the first or named "Data")
+                sheet_name = None
+                for sheet in excel_file.sheet_names:
+                    if 'data' in sheet.lower() or sheet == excel_file.sheet_names[0]:
+                        sheet_name = sheet
+                        break
+                
+                if sheet_name is None:
+                    sheet_name = excel_file.sheet_names[0]
+                
+                st.info(f"📊 Loading data from sheet: **{sheet_name}**")
+                df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
+                logger.info(f"Loaded XLSX data from sheet: {sheet_name}")
+            except Exception as e:
+                logger.warning(f"Could not load XLSX: {str(e)}")
+        
+        # Fall back to CSV if XLSX not found or failed
+        if df is None and os.path.exists(csv_path):
+            try:
+                df = pd.read_csv(csv_path)
+                logger.info(f"Loaded data from CSV")
+            except Exception as e:
+                logger.warning(f"Could not load CSV: {str(e)}")
+        
+        # If still no data, show error
+        if df is None:
             st.warning(f"""
-            ⚠️ Data file not found at `{data_path}`
+            ⚠️ Data file not found
             
             **Instructions to add data:**
             1. Download Table 10 from: https://www.abs.gov.au/statistics/labour/employment-and-unemployment/labour-force-australia
-            2. Save the CSV file to the `data/` folder as `table10.csv`
-            3. Refresh this app
+            2. Create a `data/` folder in your project directory
+            3. Save the file as either:
+               - `table10.xlsx` (Excel format - works as-is with multiple sheets!)
+               - `table10.csv` (CSV format)
+            4. Refresh this app
             """)
             return None
         
@@ -112,19 +149,41 @@ def preprocess_employment_data(df):
     df = df.copy()
     
     # Common column name variations from ABS
-    date_cols = ['DATE', 'Date', 'date', 'TIME_PERIOD', 'Month', 'month']
-    state_cols = ['STATE', 'State', 'state', 'STATE_ABBREV', 'ST']
-    value_cols = ['VALUE', 'Value', 'value', 'OBS_VALUE', 'Obs_Value']
-    series_cols = ['SERIES_ID', 'Series_ID', 'SERIES', 'Series']
+    date_cols = ['DATE', 'Date', 'date', 'TIME_PERIOD', 'Month', 'month', 'Period']
+    state_cols = ['STATE', 'State', 'state', 'STATE_ABBREV', 'ST', 'Territory']
+    value_cols = ['VALUE', 'Value', 'value', 'OBS_VALUE', 'Obs_Value', 'Data', 'Employed']
+    series_cols = ['SERIES_ID', 'Series_ID', 'SERIES', 'Series', 'Series Title']
     
-    # Find actual column names
-    date_col = next((col for col in date_cols if col in df.columns), None)
-    state_col = next((col for col in state_cols if col in df.columns), None)
-    value_col = next((col for col in value_cols if col in df.columns), None)
-    series_col = next((col for col in series_cols if col in df.columns), None)
+    # Find actual column names (case-insensitive)
+    df_cols_lower = {col.lower(): col for col in df.columns}
+    
+    date_col = next((col for col in date_cols if col.lower() in df_cols_lower), None)
+    if date_col:
+        date_col = df_cols_lower[date_col.lower()]
+    
+    state_col = next((col for col in state_cols if col.lower() in df_cols_lower), None)
+    if state_col:
+        state_col = df_cols_lower[state_col.lower()]
+    
+    value_col = next((col for col in value_cols if col.lower() in df_cols_lower), None)
+    if value_col:
+        value_col = df_cols_lower[value_col.lower()]
+    
+    series_col = next((col for col in series_cols if col.lower() in df_cols_lower), None)
+    if series_col:
+        series_col = df_cols_lower[series_col.lower()]
     
     if not all([date_col, state_col, value_col]):
-        st.error("⚠️ Data format not recognized. Please check the CSV structure.")
+        st.error(f"""
+        ⚠️ Data format not recognized. 
+        
+        Expected columns:
+        - Date/TIME_PERIOD (found: {date_col})
+        - State/Territory (found: {state_col})
+        - Value/OBS_VALUE (found: {value_col})
+        
+        Available columns in your file: {list(df.columns)}
+        """)
         return None
     
     # Rename columns to standard names
@@ -148,10 +207,14 @@ def preprocess_employment_data(df):
     
     # Extract employment type/industry from Series if available
     if 'Series' in df.columns:
-        df['Industry'] = df['Series'].str.extract(r'(Employed|Unemployed|Participation|Unemployment)')[0]
+        df['Industry'] = df['Series'].str.extract(r'(Employed|Unemployed|Participation|Unemployment|Trend|Seasonally)')[0]
         df['Industry'] = df['Industry'].fillna('Employed')
     else:
         df['Industry'] = 'Employed'
+    
+    # Remove rows with no state
+    df['State'] = df['State'].str.strip()
+    df = df[df['State'].str.len() > 0]
     
     # Sort by date
     df = df.sort_values('Date')
@@ -643,11 +706,11 @@ else:
     1. **Download the data from ABS:**
        - Visit: https://www.abs.gov.au/statistics/labour/employment-and-unemployment/labour-force-australia
        - Download **Table 10** (Labour force status by Sex, State and Territory)
-       - Save as CSV format
     
-    2. **Add to project:**
-       - Create a `data/` folder in your project directory
-       - Save the CSV file as `table10.csv`
+    2. **Add to project (choose one format):**
+       - **Option A - XLSX (Recommended)**: Save as `au-employment-dashboard/data/table10.xlsx`
+         (No conversion needed! Works with multiple sheets as-is)
+       - **Option B - CSV**: Save as `au-employment-dashboard/data/table10.csv`
     
     3. **Refresh the app:**
        - Run: `streamlit run app.py`
